@@ -1,0 +1,57 @@
+[package]
+name = "jade-client-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+description = "Rust client for the Blockstream Jade hardware wallet"
+repository = "https://github.com/coreyphillips/jade-client-rs"
+homepage = "https://github.com/coreyphillips/jade-client-rs"
+readme = "README.md"
+keywords = ["bitcoin", "hardware-wallet", "jade", "blockstream", "psbt"]
+categories = ["cryptography::cryptocurrencies", "api-bindings"]
+exclude = ["/.github"]
+
+[dependencies]
+# Framing only. minicbor reports an exact consumed byte count, which is the one
+# thing incremental frame detection needs.
+minicbor = { version = "2", features = ["alloc"] }
+# Message bodies. serde backed, so request and reply types are plain derives.
+ciborium = "0.2"
+serde = { version = "1", features = ["derive"] }
+# Jade requires CBOR byte strings for binary fields; serde would otherwise
+# encode Vec<u8> as an array of integers and the device rejects it.
+serde_bytes = "0.11"
+bitcoin = "0.32"
+async-trait = "0.1"
+log = "0.4"
+rand = "0.8"
+zeroize = "1.8"
+base64 = "0.22"
+thiserror = "2"
+
+# Optional: the bundled HTTPS implementation for the pinserver exchange. The
+# `PinServerHttp` trait itself is always available, so a consumer can supply
+# their own client instead.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "rustls-tls-native-roots",
+], optional = true }
+serde_json = "1"
+url = "2"
+tokio = { version = "1", features = ["rt", "time"] }
+
+# Optional: USB CDC serial transport. Has no iOS backend, and on Android the
+# host application normally drives USB itself.
+# default-features = false drops the libudev C dependency.
+serialport = { version = "4.10", default-features = false, optional = true }
+
+[features]
+default = ["reqwest-pinserver", "serial"]
+# The bundled reqwest backed pinserver client, with URL and address hardening.
+reqwest-pinserver = ["dep:reqwest"]
+# Serial transport, plus USB descriptor based device discovery.
+serial = ["dep:serialport"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
