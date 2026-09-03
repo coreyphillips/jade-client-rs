@@ -51,8 +51,12 @@ impl From<JadeTransportErrorCode> for JadeError {
 }
 
 /// Everything this crate can fail with.
+///
+/// Deliberately not `#[non_exhaustive]`. A binding generator that attaches FFI
+/// scaffolding to this type from another crate has to match every variant, and
+/// `non_exhaustive` would make that impossible. Adding a variant is therefore a
+/// breaking change, which is the honest signal anyway.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum JadeError {
     /// Transport layer error (Bluetooth or serial communication).
     #[error("Transport error: {error_details}")]
