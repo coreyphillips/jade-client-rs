@@ -87,8 +87,14 @@ as a finalization error.
 ships behind the `serial` feature.
 
 Bluetooth is deliberately left to the caller, because BLE permissions, pairing
-and lifecycle belong to the platform. To add one, implement `JadeTransport`
-against the Nordic UART Service:
+and lifecycle belong to the platform. [`docs/bluetooth.md`](docs/bluetooth.md)
+covers writing one: which shape suits which platform, a complete `btleplug`
+implementation, and the macOS behaviour worth knowing before you start.
+[`examples/callback_transport.rs`](examples/callback_transport.rs) is the shape
+an iOS or Android application wants, where the platform owns the radio and Rust
+only moves bytes.
+
+To add one, implement `JadeTransport` against the Nordic UART Service:
 
 | Role | UUID |
 |---|---|
