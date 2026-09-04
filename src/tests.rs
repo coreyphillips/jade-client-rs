@@ -1242,3 +1242,27 @@ mod firmware {
         assert!(!version_at_least("nonsense", "1.0.34"));
     }
 }
+
+// ============================================================================
+// Serial transport
+// ============================================================================
+
+#[cfg(feature = "serial")]
+mod serial {
+    use crate::serial::clears_modem_lines;
+
+    #[test]
+    fn modem_lines_are_cleared_only_on_the_tty_node() {
+        // Linux, and the macOS dial-in node, assert both lines on open, which
+        // reboots the device.
+        assert!(clears_modem_lines("/dev/ttyUSB0"));
+        assert!(clears_modem_lines("/dev/ttyACM0"));
+        assert!(clears_modem_lines("/dev/tty.usbserial-01EDCAEC"));
+
+        // The macOS call-out node needs both left asserted. Clearing them there
+        // stops the device answering until it is power cycled, which is the one
+        // failure this rule exists to prevent.
+        assert!(!clears_modem_lines("/dev/cu.usbserial-01EDCAEC"));
+        assert!(!clears_modem_lines("COM3"));
+    }
+}

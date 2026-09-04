@@ -62,6 +62,14 @@ pub fn enumerate_devices() -> Vec<JadeDeviceInfo> {
             if !KNOWN_USB_IDS.contains(&(info.vid, info.pid)) {
                 return None;
             }
+            // macOS exposes every USB serial device twice: /dev/cu.* is the
+            // call-out node and /dev/tty.* the dial-in one. Opening the dial-in
+            // node blocks until carrier detect is asserted, which never happens
+            // on a Jade, so offering it would hand the caller a path that hangs.
+            #[cfg(target_os = "macos")]
+            if !port.port_name.starts_with("/dev/cu.") {
+                return None;
+            }
             Some(JadeDeviceInfo {
                 path: port.port_name,
                 transport: JadeTransportKind::Serial,
@@ -78,26 +86,45 @@ pub struct SerialTransport {
     /// A std mutex rather than a tokio one: the guard is taken inside
     /// `spawn_blocking`, where a tokio guard could not be held.
     port: Arc<Mutex<Box<dyn SerialPort>>>,
+    /// What `clears_modem_lines` decided for this path, so close matches open.
+    clear_lines: bool,
+}
+
+/// Whether DTR and RTS have to be cleared for `path`.
+///
+/// On the bridge chips above these lines drive the ESP32's EN and BOOT pins, so
+/// the wrong state reboots the device or holds it in reset. The correct state is
+/// not fixed, it depends on which device node is being opened, and the reference
+/// implementation keys off exactly this prefix:
+///
+/// - `/dev/tty*`, the Linux node and the macOS dial-in node, needs both cleared,
+///   because the kernel asserts them on open and that reboots the hardware.
+/// - `/dev/cu.*`, the macOS call-out node, needs both left asserted. Clearing
+///   them there stops the device answering at all, and it stays unresponsive
+///   until it is power cycled.
+pub(crate) fn clears_modem_lines(path: &str) -> bool {
+    path.starts_with("/dev/tty")
 }
 
 impl SerialTransport {
     pub fn open(path: &str) -> Result<Self, JadeError> {
+        let clear_lines = clears_modem_lines(path);
+
         let mut port = serialport::new(path, BAUD_RATE)
             .timeout(Duration::from_millis(250))
-            // Asserting DTR or RTS resets the ESP32 on several of the bridge
-            // chips above, so the line has to come up with both clear.
-            .dtr_on_open(false)
+            .dtr_on_open(!clear_lines)
             .open()
             .map_err(|error| JadeError::ConnectionError {
                 error_details: format!("could not open {path}: {error}"),
             })?;
 
-        if let Err(error) = port.write_request_to_send(false) {
-            log::warn!("[jade] could not clear RTS on {path}: {error}");
+        if let Err(error) = port.write_request_to_send(!clear_lines) {
+            log::warn!("[jade] could not set RTS on {path}: {error}");
         }
 
         Ok(Self {
             port: Arc::new(Mutex::new(port)),
+            clear_lines,
         })
     }
 }
@@ -154,13 +181,17 @@ impl JadeTransport for SerialTransport {
 
     async fn close(&self) -> Result<(), JadeError> {
         let port = Arc::clone(&self.port);
+        let clear_lines = self.clear_lines;
         tokio::task::spawn_blocking(move || {
             let mut port = port
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // Leaving DTR or RTS asserted on close resets the device.
-            let _ = port.write_data_terminal_ready(false);
-            let _ = port.write_request_to_send(false);
+            // Only where open cleared them. Dropping the lines on a call-out
+            // node leaves the device unresponsive until it is power cycled.
+            if clear_lines {
+                let _ = port.write_data_terminal_ready(false);
+                let _ = port.write_request_to_send(false);
+            }
         })
         .await
         .map_err(|error| JadeError::IoError {

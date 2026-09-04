@@ -10,9 +10,10 @@ that unlocks a PIN protected device, and PSBT signing.
 Scope is Bitcoin single signature. Liquid, multisig, firmware updates and the
 airgapped QR mode are not covered.
 
-> Status: the protocol is implemented and covered by tests against a scripted
-> mock device, but it has not yet been exercised against physical hardware.
-> Treat 0.1.x as unproven until that lands.
+> Status: exercised against a physical Jade v1 (firmware 1.0.41, CP2104 bridge)
+> on macOS: unlock through the pinserver, account export, address verification
+> for `wpkh` and `tr`, message signing, and PSBT signing. Bluetooth, Jade Plus
+> and Linux serial remain covered only by the scripted mock device.
 
 This is an unofficial client and is not affiliated with Blockstream.
 
@@ -117,8 +118,18 @@ chips present:
 | `303a:4001` | Espressif native USB, Jade Plus |
 | `303a:1001` | Espressif USB serial/JTAG |
 
-DTR and RTS are cleared on open and close, because leaving either asserted
-resets the ESP32 on several of these bridges.
+DTR and RTS drive the ESP32's EN and BOOT pins through these bridges, so their
+state is not a free choice, and the right state depends on which device node is
+opened:
+
+| Path | DTR and RTS | Why |
+|---|---|---|
+| `/dev/tty*` | cleared | The kernel asserts them on open, which reboots the device. |
+| `/dev/cu.*` | left asserted | Clearing them stops a Jade answering at all, and it stays unresponsive until it is power cycled. |
+
+`/dev/cu.*` is the macOS call-out node. Enumeration returns only that node on
+macOS, never the `/dev/tty.*` dial-in twin, which blocks on open waiting for a
+carrier detect that a Jade never asserts.
 
 ## Cancellation
 
