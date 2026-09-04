@@ -59,6 +59,12 @@ pub trait JadeTransport: Send + Sync {
     ///
     /// Takes ownership because callback and serial implementations both hand the
     /// buffer to a blocking task, which needs a `'static` payload.
+    ///
+    /// This may await the link for as long as it needs. The caller's deadline
+    /// covers the write as well as the reply, so an implementation that never
+    /// completes, which a Bluetooth write with response does whenever the
+    /// acknowledgement never arrives, surfaces as [`JadeError::Timeout`] rather
+    /// than hanging the operation.
     async fn write_all(&self, data: Vec<u8>) -> Result<(), JadeError>;
 
     /// Read whatever has arrived, waiting at most `timeout`.
@@ -168,12 +174,35 @@ impl JadeConnection {
         let request = encode_request(&id, method, params)?;
         log::debug!("[jade] -> {method} id={id} ({} bytes)", request.len());
 
-        if let Err(error) = self.transport.write_all(request).await {
-            self.poison();
-            return Err(error);
-        }
+        let remaining = self.write_request(request, timeout).await?;
+        self.await_reply(&id, method, remaining).await
+    }
 
-        self.await_reply(&id, method, timeout).await
+    /// Write one request, and return how much of `timeout` is left for the reply.
+    ///
+    /// The write shares the caller's deadline rather than running unbounded.
+    /// `write_all` is free to await the link, and a Bluetooth write with
+    /// response does exactly that until the acknowledgement arrives, so a stalled
+    /// link would otherwise leave the whole operation pending forever and defeat
+    /// the timeout the caller asked for. On a signing call that means a request
+    /// that never returns and never fails.
+    async fn write_request(
+        &mut self,
+        request: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<Duration, JadeError> {
+        let deadline = Instant::now() + timeout;
+        match tokio::time::timeout(timeout, self.transport.write_all(request)).await {
+            Ok(Ok(())) => Ok(deadline.saturating_duration_since(Instant::now())),
+            Ok(Err(error)) => {
+                self.poison();
+                Err(error)
+            }
+            Err(_) => {
+                self.poison();
+                Err(JadeError::Timeout)
+            }
+        }
     }
 
     /// Wait for the reply to `id`, discarding log frames and stale replies.
@@ -280,12 +309,9 @@ impl JadeConnection {
         let origid = self.ids.next_id();
         let request = encode_request(&origid, method, params)?;
         log::debug!("[jade] -> {method} id={origid} ({} bytes)", request.len());
-        if let Err(error) = self.transport.write_all(request).await {
-            self.poison();
-            return Err(error);
-        }
+        let remaining = self.write_request(request, timeout).await?;
 
-        let reply = self.await_reply(&origid, method, timeout).await?;
+        let reply = self.await_reply(&origid, method, remaining).await?;
         let seqlen = reply.seqlen.unwrap_or(1).max(1);
         let mut seqnum = reply.seqnum.unwrap_or(1);
         let mut payload = crate::protocol::result_bytes(&reply.into_result(&self.min_firmware)?)?;

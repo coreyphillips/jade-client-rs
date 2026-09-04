@@ -1266,3 +1266,73 @@ mod serial {
         assert!(!clears_modem_lines("COM3"));
     }
 }
+
+// ============================================================================
+// Operation deadlines
+// ============================================================================
+
+mod deadlines {
+    use crate::error::JadeError;
+    use crate::transport::{JadeConnection, JadeTransport};
+    use async_trait::async_trait;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// A transport whose write never completes.
+    ///
+    /// This is what a Bluetooth write with response does on a degraded link:
+    /// the future stays pending because the acknowledgement never arrives.
+    struct StalledWrite;
+
+    #[async_trait]
+    impl JadeTransport for StalledWrite {
+        async fn write_all(&self, _data: Vec<u8>) -> Result<(), JadeError> {
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+
+        async fn read_some(&self, _timeout: Duration) -> Result<Vec<u8>, JadeError> {
+            Ok(Vec::new())
+        }
+
+        async fn close(&self) -> Result<(), JadeError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_write_that_never_completes_still_honours_the_deadline() {
+        let mut connection =
+            JadeConnection::new(Arc::new(StalledWrite), Arc::new(AtomicBool::new(false)));
+
+        let error = connection
+            .exchange("ping", Option::<()>::None, Duration::from_millis(100))
+            .await
+            .unwrap_err();
+
+        // While the write ran unbounded this call never returned at all, so the
+        // caller's timeout was silently not a timeout.
+        assert!(matches!(error, JadeError::Timeout), "got {error:?}");
+    }
+
+    #[tokio::test]
+    async fn a_stalled_write_poisons_the_connection() {
+        let mut connection =
+            JadeConnection::new(Arc::new(StalledWrite), Arc::new(AtomicBool::new(false)));
+        let _ = connection
+            .exchange("ping", Option::<()>::None, Duration::from_millis(50))
+            .await;
+
+        // The device never received a whole request, so the stream cannot be
+        // picked back up where it left off.
+        let error = connection
+            .exchange("ping", Option::<()>::None, Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, JadeError::DeviceDisconnected),
+            "got {error:?}"
+        );
+    }
+}

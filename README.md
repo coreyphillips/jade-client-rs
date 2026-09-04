@@ -10,10 +10,12 @@ that unlocks a PIN protected device, and PSBT signing.
 Scope is Bitcoin single signature. Liquid, multisig, firmware updates and the
 airgapped QR mode are not covered.
 
-> Status: exercised against a physical Jade v1 (firmware 1.0.41, CP2104 bridge)
-> on macOS: unlock through the pinserver, account export, address verification
-> for `wpkh` and `tr`, message signing, and PSBT signing. Bluetooth, Jade Plus
-> and Linux serial remain covered only by the scripted mock device.
+> Status: exercised against a physical Jade v1 (firmware 1.0.41) on macOS over
+> both transports, USB serial and Bluetooth: unlock through the pinserver,
+> account export, address verification for `wpkh` and `tr`, message signing,
+> PSBT signing including a reply large enough to come back fragmented,
+> cancellation and logout. Jade Plus and Linux serial remain covered only by the
+> scripted mock device.
 
 This is an unofficial client and is not affiliated with Blockstream.
 
@@ -103,6 +105,21 @@ Three rules matter, and each fails only against real hardware:
    with an unattributed error. A 30 KB PSBT is roughly 60 writes.
 3. **Clamp the chunk size** into `1..=MAX_CHUNK_BYTES`. For Bluetooth that is
    `min(negotiated_mtu - 3, 509)`.
+
+A write may take as long as it needs. The deadline a caller passes covers the
+write as well as the reply, so a stalled link ends in `JadeError::Timeout`
+rather than in an operation that never returns.
+
+Two more things matter if you drive Bluetooth from macOS, neither of them this
+crate's doing:
+
+- CoreBluetooth rotates the peripheral identifier, because Jade advertises from
+  a resolvable private address. A cached peripheral list therefore accumulates
+  stale handles for one physical device, and connecting to a stale one hangs
+  rather than failing. Take the peripheral from the scan that is running now.
+- Dropping the link without disconnecting, which is what killing a process does,
+  leaves the device's radio refusing new connections until it is power cycled.
+  Disconnect on the way out, on signals included.
 
 ### Serial
 
