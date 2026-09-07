@@ -1336,3 +1336,127 @@ mod deadlines {
         );
     }
 }
+
+mod signed_psbt {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::transaction::Version;
+    use bitcoin::{Amount, OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+
+    use crate::client::verify_signed_psbt;
+    use crate::JadeError;
+
+    fn previous_transaction(value: u64) -> Transaction {
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(value),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        }
+    }
+
+    fn unsigned() -> Psbt {
+        let previous = previous_transaction(10_000);
+        let spend = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(previous.compute_txid(), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(9_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(spend).expect("unsigned psbt");
+        psbt.inputs[0].witness_utxo = Some(previous.output[0].clone());
+        psbt.inputs[0].non_witness_utxo = Some(previous);
+        psbt
+    }
+
+    fn signed_from(sent: &Psbt) -> Psbt {
+        let mut signed = sent.clone();
+        signed.inputs[0].final_script_witness = Some(Witness::new());
+        signed
+    }
+
+    #[test]
+    fn a_dropped_previous_transaction_is_accepted() {
+        let sent = unsigned();
+        let mut signed = signed_from(&sent);
+        signed.inputs[0].non_witness_utxo = None;
+
+        assert_eq!(verify_signed_psbt(&sent, &signed), Ok(()));
+    }
+
+    #[test]
+    fn a_dropped_witness_utxo_is_accepted() {
+        let sent = unsigned();
+        let mut signed = signed_from(&sent);
+        signed.inputs[0].witness_utxo = None;
+
+        assert_eq!(verify_signed_psbt(&sent, &signed), Ok(()));
+    }
+
+    #[test]
+    fn a_previous_transaction_echoed_without_witness_data_is_accepted() {
+        let mut sent = unsigned();
+        let mut with_witness = previous_transaction(10_000);
+        with_witness.input.push(TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::from_slice(&[vec![1u8, 2, 3]]),
+        });
+        sent.inputs[0].non_witness_utxo = Some(with_witness.clone());
+        let mut signed = signed_from(&sent);
+        let mut stripped = with_witness;
+        stripped.input[0].witness = Witness::new();
+        signed.inputs[0].non_witness_utxo = Some(stripped);
+
+        assert_eq!(verify_signed_psbt(&sent, &signed), Ok(()));
+    }
+
+    #[test]
+    fn an_altered_previous_transaction_is_rejected() {
+        let sent = unsigned();
+        let mut signed = signed_from(&sent);
+        signed.inputs[0].non_witness_utxo = Some(previous_transaction(20_000));
+
+        assert!(matches!(
+            verify_signed_psbt(&sent, &signed),
+            Err(JadeError::InvalidPsbt { .. })
+        ));
+    }
+
+    #[test]
+    fn an_altered_witness_utxo_is_rejected() {
+        let sent = unsigned();
+        let mut signed = signed_from(&sent);
+        signed.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::new(),
+        });
+
+        assert!(matches!(
+            verify_signed_psbt(&sent, &signed),
+            Err(JadeError::InvalidPsbt { .. })
+        ));
+    }
+
+    #[test]
+    fn a_reply_without_signatures_is_rejected() {
+        let sent = unsigned();
+        let signed = sent.clone();
+
+        assert_eq!(
+            verify_signed_psbt(&sent, &signed),
+            Err(JadeError::NothingSigned)
+        );
+    }
+}
