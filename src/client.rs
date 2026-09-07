@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use bitcoin::bip32::{DerivationPath, Xpub};
 use bitcoin::psbt::Psbt;
+use bitcoin::Transaction;
 use rand::RngCore;
 use serde::Serialize;
 use zeroize::Zeroizing;
@@ -552,13 +553,26 @@ pub(crate) fn verify_signed_psbt(sent: &Psbt, signed: &Psbt) -> Result<(), JadeE
         });
     }
 
+    // The device answers with a trimmed PSBT: it may drop the previous transaction of an input
+    // from its reply, or echo it without its witness data. A field that went missing is fine, since
+    // the caller's copy fills it back in when the two are combined, and a previous transaction is
+    // compared by txid, which covers everything the signature depends on. A field that came back
+    // with different content is not.
     for (index, (before, after)) in sent.inputs.iter().zip(signed.inputs.iter()).enumerate() {
-        if before.witness_utxo != after.witness_utxo {
+        if after.witness_utxo.is_some() && before.witness_utxo != after.witness_utxo {
             return Err(JadeError::InvalidPsbt {
                 error_details: format!("device altered the witness UTXO of input {index}"),
             });
         }
-        if before.non_witness_utxo != after.non_witness_utxo {
+        let before_txid = before
+            .non_witness_utxo
+            .as_ref()
+            .map(Transaction::compute_txid);
+        let after_txid = after
+            .non_witness_utxo
+            .as_ref()
+            .map(Transaction::compute_txid);
+        if after_txid.is_some() && before_txid != after_txid {
             return Err(JadeError::InvalidPsbt {
                 error_details: format!("device altered the previous transaction of input {index}"),
             });
