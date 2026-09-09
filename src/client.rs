@@ -71,14 +71,27 @@ impl Jade {
         let aborted = Arc::new(AtomicBool::new(false));
         let mut connection = JadeConnection::new(transport, aborted);
 
-        let version = Self::read_version(&mut connection).await?;
-        Self::add_entropy(&mut connection).await?;
+        let version = match Self::initialize(&mut connection).await {
+            Ok(version) => version,
+            Err(error) => {
+                if let Err(close_error) = connection.transport().close().await {
+                    log::warn!("[jade] could not close a failed connection: {close_error}");
+                }
+                return Err(error);
+            }
+        };
 
         Ok(Self {
             connection,
             version,
             unlocked_network: None,
         })
+    }
+
+    async fn initialize(connection: &mut JadeConnection) -> Result<JadeVersionInfo, JadeError> {
+        let version = Self::read_version(connection).await?;
+        Self::add_entropy(connection).await?;
+        Ok(version)
     }
 
     /// The version summary, as of the last read.
@@ -491,33 +504,44 @@ impl Jade {
             }
         }
 
-        let Ok(device_fingerprint) = self.master_fingerprint(network).await else {
-            return Ok(());
-        };
-        let mut seen = Vec::new();
-        let mut matched = false;
-        for input in &psbt.inputs {
-            for (fingerprint, _) in input.bip32_derivation.values() {
-                let rendered = format!("{fingerprint:08x}");
-                matched |= rendered == device_fingerprint;
-                seen.push(rendered);
-            }
-            for (_, (fingerprint, _)) in input.tap_key_origins.values() {
-                let rendered = format!("{fingerprint:08x}");
-                matched |= rendered == device_fingerprint;
-                seen.push(rendered);
-            }
-        }
-        if !seen.is_empty() && !matched {
-            seen.sort();
-            seen.dedup();
-            return Err(JadeError::FingerprintMismatch {
-                device: device_fingerprint,
-                psbt: seen.join(", "),
-            });
-        }
-        Ok(())
+        let device_fingerprint = self.master_fingerprint(network).await?;
+        verify_psbt_fingerprint(psbt, &device_fingerprint)
     }
+}
+
+pub(crate) fn verify_psbt_fingerprint(
+    psbt: &Psbt,
+    device_fingerprint: &str,
+) -> Result<(), JadeError> {
+    let mut seen = Vec::new();
+    let mut matched = false;
+    for input in &psbt.inputs {
+        for (fingerprint, _) in input.bip32_derivation.values() {
+            let rendered = format!("{fingerprint:08x}");
+            matched |= rendered == device_fingerprint;
+            seen.push(rendered);
+        }
+        for (_, (fingerprint, _)) in input.tap_key_origins.values() {
+            let rendered = format!("{fingerprint:08x}");
+            matched |= rendered == device_fingerprint;
+            seen.push(rendered);
+        }
+    }
+
+    if seen.is_empty() {
+        return Err(JadeError::InvalidPsbt {
+            error_details: "no input carries a BIP32 key origin".to_string(),
+        });
+    }
+    if !matched {
+        seen.sort();
+        seen.dedup();
+        return Err(JadeError::FingerprintMismatch {
+            device: device_fingerprint.to_string(),
+            psbt: seen.join(", "),
+        });
+    }
+    Ok(())
 }
 
 /// Confirm the device answered the question that was asked.

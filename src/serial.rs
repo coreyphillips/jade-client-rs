@@ -85,7 +85,7 @@ pub fn enumerate_devices() -> Vec<JadeDeviceInfo> {
 pub struct SerialTransport {
     /// A std mutex rather than a tokio one: the guard is taken inside
     /// `spawn_blocking`, where a tokio guard could not be held.
-    port: Arc<Mutex<Box<dyn SerialPort>>>,
+    port: Arc<Mutex<Option<Box<dyn SerialPort>>>>,
     /// What `clears_modem_lines` decided for this path, so close matches open.
     clear_lines: bool,
 }
@@ -123,7 +123,7 @@ impl SerialTransport {
         }
 
         Ok(Self {
-            port: Arc::new(Mutex::new(port)),
+            port: Arc::new(Mutex::new(Some(port))),
             clear_lines,
         })
     }
@@ -137,12 +137,13 @@ impl JadeTransport for SerialTransport {
             let mut port = port
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let port = port.as_mut().ok_or(JadeError::DeviceDisconnected)?;
             for chunk in data.chunks(CHUNK_BYTES) {
-                std::io::Write::write_all(&mut *port, chunk).map_err(|error| {
+                std::io::Write::write_all(&mut **port, chunk).map_err(|error| {
                     JadeError::transport(format!("serial write failed: {error}"))
                 })?;
             }
-            std::io::Write::flush(&mut *port)
+            std::io::Write::flush(&mut **port)
                 .map_err(|error| JadeError::transport(format!("serial flush failed: {error}")))
         })
         .await
@@ -157,12 +158,13 @@ impl JadeTransport for SerialTransport {
             let mut port = port
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let port = port.as_mut().ok_or(JadeError::DeviceDisconnected)?;
             if let Err(error) = port.set_timeout(timeout) {
                 log::debug!("[jade] could not set the serial timeout: {error}");
             }
 
             let mut buffer = vec![0u8; 4096];
-            match std::io::Read::read(&mut *port, &mut buffer) {
+            match std::io::Read::read(&mut **port, &mut buffer) {
                 Ok(read) => {
                     buffer.truncate(read);
                     Ok(buffer)
@@ -186,12 +188,16 @@ impl JadeTransport for SerialTransport {
             let mut port = port
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(mut port) = port.take() else {
+                return;
+            };
             // Only where open cleared them. Dropping the lines on a call-out
             // node leaves the device unresponsive until it is power cycled.
             if clear_lines {
                 let _ = port.write_data_terminal_ready(false);
                 let _ = port.write_request_to_send(false);
             }
+            drop(port);
         })
         .await
         .map_err(|error| JadeError::IoError {

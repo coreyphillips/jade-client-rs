@@ -19,7 +19,7 @@
 
 #[cfg(feature = "reqwest-pinserver")]
 use std::net::IpAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -32,7 +32,6 @@ use crate::types::JadeNetwork;
 const UNLOCK_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// How long a single pinserver call may take.
-#[cfg(feature = "reqwest-pinserver")]
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Upper bound on a pinserver response body.
@@ -121,7 +120,7 @@ impl PinServerHttp for ReqwestPinServer {
 
         // reqwest embeds the full URL in its Display output, so it is stripped
         // before the error reaches a log or the application.
-        let response = request.send().await.map_err(|error| {
+        let mut response = request.send().await.map_err(|error| {
             let error = error.without_url();
             JadeError::PinServerError {
                 error_details: format!("pin server request failed: {error}"),
@@ -144,24 +143,42 @@ impl PinServerHttp for ReqwestPinServer {
             }
         }
 
-        let bytes = response.bytes().await.map_err(|error| {
+        let mut bytes = Vec::with_capacity(
+            response
+                .content_length()
+                .unwrap_or_default()
+                .min(MAX_BODY_BYTES) as usize,
+        );
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
             let error = error.without_url();
             JadeError::PinServerError {
                 error_details: format!("could not read the pin server response: {error}"),
             }
-        })?;
-
-        // Re-check after reading, because a response without Content-Length
-        // slips past the check above.
-        if bytes.len() as u64 > MAX_BODY_BYTES {
-            return Err(JadeError::PinServerError {
-                error_details: format!(
-                    "pin server response exceeds the {MAX_BODY_BYTES} byte limit"
-                ),
-            });
+        })? {
+            append_body_chunk(&mut bytes, &chunk)?;
         }
 
-        Ok(bytes.to_vec())
+        Ok(bytes)
+    }
+}
+
+#[cfg(feature = "reqwest-pinserver")]
+pub(crate) fn append_body_chunk(body: &mut Vec<u8>, chunk: &[u8]) -> Result<(), JadeError> {
+    let length = body
+        .len()
+        .checked_add(chunk.len())
+        .ok_or_else(body_too_large)?;
+    if length as u64 > MAX_BODY_BYTES {
+        return Err(body_too_large());
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
+#[cfg(feature = "reqwest-pinserver")]
+fn body_too_large() -> JadeError {
+    JadeError::PinServerError {
+        error_details: format!("pin server response exceeds the {MAX_BODY_BYTES} byte limit"),
     }
 }
 
@@ -307,12 +324,23 @@ pub(crate) async fn run_unlock(
     http: &dyn PinServerHttp,
     epoch: u64,
 ) -> Result<(), JadeError> {
+    run_unlock_with_timeout(connection, network, http, epoch, UNLOCK_TIMEOUT).await
+}
+
+pub(crate) async fn run_unlock_with_timeout(
+    connection: &mut JadeConnection,
+    network: JadeNetwork,
+    http: &dyn PinServerHttp,
+    epoch: u64,
+    timeout: Duration,
+) -> Result<(), JadeError> {
+    let deadline = Instant::now() + timeout;
     let params = AuthUserParams {
         network: network.wire_name(),
         epoch,
     };
     let reply = connection
-        .exchange("auth_user", Some(params), UNLOCK_TIMEOUT)
+        .exchange("auth_user", Some(params), remaining_until(deadline)?)
         .await?;
     let mut result = reply.into_result(crate::types::MIN_JADE_FIRMWARE)?;
 
@@ -340,13 +368,31 @@ pub(crate) async fn run_unlock(
             )));
         }
 
-        let body = perform(http, &request.params).await;
-        result = send_pin(connection, body).await?;
+        let body = perform_before_deadline(http, &request.params, deadline).await;
+        result = send_pin(connection, body, remaining_until(deadline)?).await?;
     }
 
     Err(JadeError::PinServerError {
         error_details: format!("unlock did not finish within {MAX_ROUND_TRIPS} round trips"),
     })
+}
+
+async fn perform_before_deadline(
+    http: &dyn PinServerHttp,
+    params: &HttpRequestParams,
+    deadline: Instant,
+) -> Option<ciborium::Value> {
+    let timeout = match remaining_until(deadline) {
+        Ok(remaining) => remaining.min(HTTP_TIMEOUT),
+        Err(_) => return None,
+    };
+    match tokio::time::timeout(timeout, perform(http, params)).await {
+        Ok(result) => result,
+        Err(_) => {
+            log::warn!("[jade] pin server call timed out");
+            None
+        }
+    }
 }
 
 /// Make the call the device asked for, returning the params for the follow-up.
@@ -408,9 +454,18 @@ async fn perform(http: &dyn PinServerHttp, params: &HttpRequestParams) -> Option
 async fn send_pin(
     connection: &mut JadeConnection,
     params: Option<ciborium::Value>,
+    timeout: Duration,
 ) -> Result<ciborium::Value, JadeError> {
-    let reply = connection.exchange("pin", params, UNLOCK_TIMEOUT).await?;
+    let reply = connection.exchange("pin", params, timeout).await?;
     reply.into_result(crate::types::MIN_JADE_FIRMWARE)
+}
+
+fn remaining_until(deadline: Instant) -> Result<Duration, JadeError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(JadeError::Timeout);
+    }
+    Ok(remaining)
 }
 
 /// Whether a URL's host is an onion service.
