@@ -39,6 +39,12 @@ pub(crate) fn try_take_frame(buf: &mut Vec<u8>) -> Result<Option<Vec<u8>>, JadeE
     match decoder.skip() {
         Ok(()) => {
             let length = decoder.position();
+            if length > MAX_FRAME_BYTES {
+                buf.clear();
+                return Err(JadeError::protocol(format!(
+                    "frame exceeded {MAX_FRAME_BYTES} bytes"
+                )));
+            }
             Ok(Some(buf.drain(..length).collect()))
         }
         Err(error) if error.is_end_of_input() => {

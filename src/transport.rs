@@ -18,6 +18,7 @@ use serde::Serialize;
 use crate::error::JadeError;
 use crate::protocol::{
     classify, decode_reply, encode_request, try_take_frame, JadeReply, ReplyMatch, RequestIds,
+    MAX_FRAME_BYTES,
 };
 
 /// Bluetooth writes are capped here regardless of the reported MTU.
@@ -39,6 +40,12 @@ const READ_CHUNK_TIMEOUT_MS: u32 = 250;
 /// A native implementation that returns immediately with no data would
 /// otherwise turn the read loop into a busy spin that pins a blocking thread.
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Maximum number of fragments accepted for one extended reply.
+pub(crate) const MAX_REPLY_FRAGMENTS: u32 = 64;
+
+/// Maximum bytes accepted after reassembling an extended reply.
+pub(crate) const MAX_REASSEMBLED_BYTES: usize = MAX_FRAME_BYTES;
 
 /// A byte pipe to a device.
 ///
@@ -306,15 +313,28 @@ impl JadeConnection {
     ) -> Result<Vec<u8>, JadeError> {
         self.check_usable()?;
 
+        let deadline = Instant::now() + timeout;
         let origid = self.ids.next_id();
         let request = encode_request(&origid, method, params)?;
         log::debug!("[jade] -> {method} id={origid} ({} bytes)", request.len());
-        let remaining = self.write_request(request, timeout).await?;
+        let remaining = remaining_until(deadline)?;
+        let remaining = self.write_request(request, remaining).await?;
 
         let reply = self.await_reply(&origid, method, remaining).await?;
-        let seqlen = reply.seqlen.unwrap_or(1).max(1);
+        let seqlen = reply.seqlen.unwrap_or(1);
         let mut seqnum = reply.seqnum.unwrap_or(1);
         let mut payload = crate::protocol::result_bytes(&reply.into_result(&self.min_firmware)?)?;
+
+        if seqnum != 1 || seqlen == 0 || seqlen > MAX_REPLY_FRAGMENTS {
+            self.poison();
+            return Err(JadeError::protocol(format!(
+                "invalid fragment sequence {seqnum} of {seqlen}"
+            )));
+        }
+        if payload.len() > MAX_REASSEMBLED_BYTES {
+            self.poison();
+            return Err(reply_too_large());
+        }
 
         if seqlen > 1 {
             log::debug!("[jade] {method} reply spans {seqlen} fragments");
@@ -322,8 +342,15 @@ impl JadeConnection {
 
         while seqnum < seqlen {
             let next = seqnum + 1;
+            let remaining = match remaining_until(deadline) {
+                Ok(remaining) => remaining,
+                Err(error) => {
+                    self.poison();
+                    return Err(error);
+                }
+            };
             let fragment = match self
-                .fetch_fragment(&origid, method, next, seqlen, timeout)
+                .fetch_fragment(&origid, method, next, seqlen, remaining)
                 .await
             {
                 Ok(fragment) => fragment,
@@ -334,6 +361,17 @@ impl JadeConnection {
                     return Err(error);
                 }
             };
+            let combined_len = match payload.len().checked_add(fragment.len()) {
+                Some(length) => length,
+                None => {
+                    self.poison();
+                    return Err(reply_too_large());
+                }
+            };
+            if combined_len > MAX_REASSEMBLED_BYTES {
+                self.poison();
+                return Err(reply_too_large());
+            }
             payload.extend_from_slice(&fragment);
             seqnum = next;
         }
@@ -367,13 +405,32 @@ impl JadeConnection {
             .exchange("get_extended_data", Some(params), timeout)
             .await?;
 
-        if let Some(reported) = reply.seqnum {
-            if reported != seqnum {
-                return Err(JadeError::protocol(format!(
-                    "expected fragment {seqnum}, device sent {reported}"
-                )));
-            }
+        if reply.seqnum != Some(seqnum) {
+            return Err(JadeError::protocol(format!(
+                "expected fragment {seqnum}, device sent {:?}",
+                reply.seqnum
+            )));
+        }
+        if reply.seqlen != Some(seqlen) {
+            return Err(JadeError::protocol(format!(
+                "expected {seqlen} fragments, device reported {:?}",
+                reply.seqlen
+            )));
         }
         crate::protocol::result_bytes(&reply.into_result(&self.min_firmware)?)
     }
+}
+
+fn remaining_until(deadline: Instant) -> Result<Duration, JadeError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(JadeError::Timeout);
+    }
+    Ok(remaining)
+}
+
+fn reply_too_large() -> JadeError {
+    JadeError::protocol(format!(
+        "extended reply exceeded the {MAX_REASSEMBLED_BYTES} byte limit"
+    ))
 }

@@ -601,6 +601,7 @@ mod connection {
         pending: Mutex<VecDeque<Vec<u8>>>,
         writes: Mutex<Vec<Vec<u8>>>,
         read_chunk: usize,
+        read_delay: Duration,
         fail_next_read: AtomicBool,
         closed: AtomicBool,
     }
@@ -612,6 +613,7 @@ mod connection {
                 pending: Mutex::new(VecDeque::new()),
                 writes: Mutex::new(Vec::new()),
                 read_chunk: usize::MAX,
+                read_delay: Duration::ZERO,
                 fail_next_read: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
             })
@@ -623,6 +625,7 @@ mod connection {
                 pending: Mutex::new(VecDeque::new()),
                 writes: Mutex::new(Vec::new()),
                 read_chunk,
+                read_delay: Duration::ZERO,
                 fail_next_read: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
             };
@@ -630,8 +633,24 @@ mod connection {
             Arc::new(mock)
         }
 
+        fn with_read_delay(responders: Vec<Responder>, read_delay: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                responders: Mutex::new(responders.into()),
+                pending: Mutex::new(VecDeque::new()),
+                writes: Mutex::new(Vec::new()),
+                read_chunk: usize::MAX,
+                read_delay,
+                fail_next_read: AtomicBool::new(false),
+                closed: AtomicBool::new(false),
+            })
+        }
+
         pub(super) fn write_count(&self) -> usize {
             self.writes.lock().unwrap().len()
+        }
+
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::SeqCst)
         }
 
         /// The raw bytes of the nth request, for byte level assertions.
@@ -661,9 +680,15 @@ mod connection {
             Ok(())
         }
 
-        async fn read_some(&self, _timeout: Duration) -> Result<Vec<u8>, JadeError> {
+        async fn read_some(&self, timeout: Duration) -> Result<Vec<u8>, JadeError> {
             if self.fail_next_read.swap(false, Ordering::SeqCst) {
                 return Err(JadeError::DeviceDisconnected);
+            }
+            if !self.read_delay.is_zero() {
+                tokio::time::sleep(self.read_delay.min(timeout)).await;
+                if self.read_delay > timeout {
+                    return Ok(Vec::new());
+                }
             }
             let mut pending = self.pending.lock().unwrap();
             let Some(mut next) = pending.pop_front() else {
@@ -688,10 +713,41 @@ mod connection {
         })
     }
 
+    fn version_info() -> ciborium::Value {
+        ciborium::Value::Map(vec![
+            (text("JADE_VERSION"), text("1.0.34")),
+            (text("JADE_STATE"), text("READY")),
+        ])
+    }
+
     pub(super) fn connect(mock: Arc<MockTransport>) -> (JadeConnection, Arc<AtomicBool>) {
         let aborted = Arc::new(AtomicBool::new(false));
         let connection = JadeConnection::new(mock, Arc::clone(&aborted));
         (connection, aborted)
+    }
+
+    #[tokio::test]
+    async fn failed_initialization_closes_the_transport() {
+        let add_entropy_error: Responder = Box::new(|request: &SeenRequest| {
+            cbor_map(vec![
+                ("id", text(&request.id)),
+                (
+                    "error",
+                    ciborium::Value::Map(vec![
+                        (text("code"), int(-32602)),
+                        (text("message"), text("bad entropy")),
+                    ]),
+                ),
+            ])
+        });
+        let mock = MockTransport::new(vec![ok_reply(version_info()), add_entropy_error]);
+
+        let error = crate::Jade::connect(Arc::clone(&mock) as Arc<dyn JadeTransport>)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, JadeError::DeviceError { .. }));
+        assert!(mock.is_closed());
     }
 
     #[tokio::test]
@@ -862,6 +918,88 @@ mod connection {
     }
 
     #[tokio::test]
+    async fn an_excessive_fragment_count_is_rejected() {
+        let responder: Responder = Box::new(|request: &SeenRequest| {
+            cbor_map(vec![
+                ("id", text(&request.id)),
+                ("result", ciborium::Value::Bytes(vec![1])),
+                ("seqnum", int(1)),
+                (
+                    "seqlen",
+                    int(i64::from(crate::transport::MAX_REPLY_FRAGMENTS + 1)),
+                ),
+            ])
+        });
+        let mock = MockTransport::new(vec![responder]);
+        let (mut connection, _) = connect(Arc::clone(&mock));
+
+        let error = connection
+            .exchange_reassembled("sign_psbt", Option::<()>::None, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, JadeError::ProtocolError { .. }));
+        assert_eq!(mock.write_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_reassembled_reply_is_rejected() {
+        let fragment = |seqnum: i64| -> Responder {
+            Box::new(move |request: &SeenRequest| {
+                cbor_map(vec![
+                    ("id", text(&request.id)),
+                    (
+                        "result",
+                        ciborium::Value::Bytes(vec![
+                            0;
+                            crate::transport::MAX_REASSEMBLED_BYTES / 2 + 1
+                        ]),
+                    ),
+                    ("seqnum", int(seqnum)),
+                    ("seqlen", int(2)),
+                ])
+            })
+        };
+        let mock = MockTransport::new(vec![fragment(1), fragment(2)]);
+        let (mut connection, _) = connect(mock);
+
+        let error = connection
+            .exchange_reassembled("sign_psbt", Option::<()>::None, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, JadeError::ProtocolError { .. }));
+    }
+
+    #[tokio::test]
+    async fn fragments_share_one_operation_deadline() {
+        let fragment = |bytes: Vec<u8>, seqnum: i64, seqlen: i64| -> Responder {
+            Box::new(move |request: &SeenRequest| {
+                cbor_map(vec![
+                    ("id", text(&request.id)),
+                    ("result", ciborium::Value::Bytes(bytes.clone())),
+                    ("seqnum", int(seqnum)),
+                    ("seqlen", int(seqlen)),
+                ])
+            })
+        };
+        let mock = MockTransport::with_read_delay(
+            vec![fragment(vec![1], 1, 2), fragment(vec![2], 2, 2)],
+            Duration::from_millis(60),
+        );
+        let (mut connection, _) = connect(mock);
+        let started = std::time::Instant::now();
+
+        let error = connection
+            .exchange_reassembled("sign_psbt", Option::<()>::None, Duration::from_millis(100))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, JadeError::Timeout);
+        assert!(started.elapsed() < Duration::from_millis(180));
+    }
+
+    #[tokio::test]
     async fn a_transport_error_poisons_the_connection() {
         // A failure mid frame leaves no way to find the next boundary, so the
         // connection must refuse further work rather than desynchronise.
@@ -941,6 +1079,7 @@ mod unlock {
     use crate::types::JadeNetwork;
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     /// A pinserver that never touches the network.
     struct FakePinServer {
@@ -983,6 +1122,20 @@ mod unlock {
                 .unwrap()
                 .take()
                 .unwrap_or(Ok(b"{}".to_vec()))
+        }
+    }
+
+    struct StalledPinServer;
+
+    #[async_trait]
+    impl PinServerHttp for StalledPinServer {
+        async fn request(
+            &self,
+            _url: &str,
+            _method: &str,
+            _body: Option<String>,
+        ) -> Result<Vec<u8>, JadeError> {
+            std::future::pending().await
         }
     }
 
@@ -1124,6 +1277,40 @@ mod unlock {
             }
         };
         assert!(!writes_have_params, "pin must be sent with no params");
+    }
+
+    #[tokio::test]
+    async fn a_stalled_pinserver_honours_the_unlock_deadline() {
+        let mock = MockTransport::new(vec![http_request_reply(
+            vec!["https://jadepin.blockstream.com/get_pin"],
+            "pin",
+        )]);
+        let (mut connection, _) = connect(mock);
+        let started = Instant::now();
+
+        let error = pinserver::run_unlock_with_timeout(
+            &mut connection,
+            JadeNetwork::Mainnet,
+            &StalledPinServer,
+            0,
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, JadeError::Timeout);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(feature = "reqwest-pinserver")]
+    #[test]
+    fn a_chunk_that_exceeds_the_body_limit_is_rejected_before_append() {
+        let mut body = vec![0; 64 * 1024];
+
+        let error = pinserver::append_body_chunk(&mut body, &[1]).unwrap_err();
+
+        assert!(matches!(error, JadeError::PinServerError { .. }));
+        assert_eq!(body.len(), 64 * 1024);
     }
 
     #[tokio::test]
@@ -1339,10 +1526,12 @@ mod deadlines {
 
 mod signed_psbt {
     use bitcoin::absolute::LockTime;
+    use bitcoin::bip32::{DerivationPath, Fingerprint};
+    use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
     use bitcoin::transaction::Version;
     use bitcoin::{Amount, OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
 
-    use crate::client::verify_signed_psbt;
+    use crate::client::{verify_psbt_fingerprint, verify_signed_psbt};
     use crate::JadeError;
 
     fn previous_transaction(value: u64) -> Transaction {
@@ -1383,6 +1572,49 @@ mod signed_psbt {
         let mut signed = sent.clone();
         signed.inputs[0].final_script_witness = Some(Witness::new());
         signed
+    }
+
+    #[test]
+    fn a_psbt_without_key_origins_is_rejected() {
+        let psbt = unsigned();
+
+        let error = verify_psbt_fingerprint(&psbt, "01020304").unwrap_err();
+
+        assert!(matches!(error, JadeError::InvalidPsbt { .. }));
+    }
+
+    #[test]
+    fn a_psbt_for_another_fingerprint_is_rejected() {
+        let mut psbt = unsigned();
+        let secret_key = SecretKey::from_slice(&[1; 32]).expect("valid secret key");
+        let public_key = PublicKey::from_secret_key(&Secp256k1::new(), &secret_key);
+        psbt.inputs[0].bip32_derivation.insert(
+            public_key,
+            (Fingerprint::from([1, 2, 3, 4]), DerivationPath::master()),
+        );
+
+        let error = verify_psbt_fingerprint(&psbt, "05060708").unwrap_err();
+
+        assert_eq!(
+            error,
+            JadeError::FingerprintMismatch {
+                device: "05060708".to_string(),
+                psbt: "01020304".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_psbt_for_the_device_fingerprint_is_accepted() {
+        let mut psbt = unsigned();
+        let secret_key = SecretKey::from_slice(&[1; 32]).expect("valid secret key");
+        let public_key = PublicKey::from_secret_key(&Secp256k1::new(), &secret_key);
+        psbt.inputs[0].bip32_derivation.insert(
+            public_key,
+            (Fingerprint::from([1, 2, 3, 4]), DerivationPath::master()),
+        );
+
+        assert_eq!(verify_psbt_fingerprint(&psbt, "01020304"), Ok(()));
     }
 
     #[test]
